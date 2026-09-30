@@ -67,7 +67,11 @@ export default function App() {
     const connectWebSocket = () => {
       try {
         const defaultProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const defaultHost = window.location.hostname === 'localhost' ? 'localhost:4000' : window.location.host;
+        const defaultHost = window.location.hostname === 'localhost' 
+          ? 'localhost:4000' 
+          : window.location.hostname.includes('vercel.app')
+          ? 'outageops.onrender.com'
+          : window.location.host;
         const wsUrl = import.meta.env.VITE_WS_URL || `${defaultProtocol}//${defaultHost}`;
         
         ws = new WebSocket(wsUrl);
