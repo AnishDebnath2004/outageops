@@ -1,12 +1,53 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   AlertTriangle, CheckCircle2, Terminal, ShieldAlert, 
-  Send, Users, Lock, Clock, Filter, Download, Zap
+  Send, Users, Lock, Clock, Filter, Download, Zap, Radio
 } from 'lucide-react';
+
+const DEFAULT_INCIDENT = {
+  id: "INC-8921",
+  title: "Critical: Database Connection Pool Exhaustion & Gateway 504s",
+  severity: "P1 - CRITICAL",
+  startedAt: new Date().toISOString(),
+  commander: "Anish (Lead SRE)",
+  status: "INVESTIGATING",
+  runbook: [
+    { id: 1, title: "Isolate Failing Read Replicas", status: "PENDING", lockedBy: null, lockedAt: null },
+    { id: 2, title: "Scale Connection Pool Limit in PgBouncer", status: "PENDING", lockedBy: null, lockedAt: null },
+    { id: 3, title: "Flush Redis Stale Cache Keys", status: "PENDING", lockedBy: null, lockedAt: null },
+    { id: 4, title: "Verify Latency & Drop Error Rate below 1%", status: "PENDING", lockedBy: null, lockedAt: null },
+    { id: 5, title: "Promote Standby Master if Primary Unresponsive", status: "PENDING", lockedBy: null, lockedAt: null }
+  ],
+  timeline: [
+    {
+      id: "ev-1",
+      timestamp: new Date().toISOString(),
+      user: "System Watchdog",
+      message: "Automated alert triggered: Error rate spiked past 18.4%"
+    }
+  ]
+};
+
+const DEMO_SERVICES = ["api-gateway", "auth-service", "postgres-master", "redis-cluster", "billing-worker"];
+const DEMO_ERRORS = [
+  "Connection pool exhausted: max active 100/100 reached",
+  "HTTP 504 Gateway Timeout while proxying to /v1/checkout",
+  "Deadlock detected on table 'accounts_ledger' for tx_id 98402",
+  "Redis command timed out after 2000ms: ETIMEDOUT",
+  "Disk I/O wait spike: 98% utilization on /var/lib/postgresql/data",
+  "CPU throttling threshold exceeded (99.8%) on container pod-auth-9x8",
+  "Heartbeat check missed for replica node db-replica-02"
+];
+const DEMO_NORMALS = [
+  "Health probe OK: 200 latency=12ms",
+  "Handling request GET /api/v2/metrics",
+  "Cache hit for user session key: usr_8921",
+  "Worker heartbeat acknowledged"
+];
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState("Anish (Lead SRE)");
-  const [incident, setIncident] = useState(null);
+  const [incident, setIncident] = useState(DEFAULT_INCIDENT);
   const [logs, setLogs] = useState([]);
   const [filterLevel, setFilterLevel] = useState("ALL");
   const [chatInput, setChatInput] = useState("");
@@ -16,49 +57,115 @@ export default function App() {
   const socketRef = useRef(null);
   const logTerminalRef = useRef(null);
   const throughputCounter = useRef(0);
+  const simSequenceRef = useRef(1);
 
-  // 1. WebSocket Setup
+  // 1. WebSocket Setup with Environment Variable Support
   useEffect(() => {
-    const ws = new WebSocket("ws://localhost:4000");
-    socketRef.current = ws;
+    let ws = null;
+    let reconnectTimeout = null;
 
-    ws.onopen = () => setIsConnected(true);
-    ws.onclose = () => setIsConnected(false);
+    const connectWebSocket = () => {
+      try {
+        const defaultProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = import.meta.env.VITE_WS_URL || `${defaultProtocol}//localhost:4000`;
+        
+        ws = new WebSocket(wsUrl);
+        socketRef.current = ws;
 
-    ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
+        ws.onopen = () => {
+          setIsConnected(true);
+        };
 
-      if (msg.type === "INIT_STATE") {
-        setIncident(msg.data);
-      } else if (msg.type === "STATE_UPDATED") {
-        setIncident(msg.data);
-      } else if (msg.type === "TIMELINE_EVENT") {
-        setIncident(prev => prev ? {
-          ...prev,
-          timeline: [msg.event, ...prev.timeline]
-        } : prev);
-      } else if (msg.type === "LOG_BATCH") {
-        throughputCounter.current += msg.batch.length;
-        // Keep maximum 500 recent logs in memory to maintain 60 FPS
-        setLogs(prev => [...prev, ...msg.batch].slice(-500));
-      } else if (msg.type === "LOCK_ERROR") {
-        alert(msg.message);
+        ws.onclose = () => {
+          setIsConnected(false);
+          // Try reconnecting after 5 seconds if running locally or configured
+          reconnectTimeout = setTimeout(connectWebSocket, 5000);
+        };
+
+        ws.onerror = () => {
+          setIsConnected(false);
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+
+            if (msg.type === "INIT_STATE") {
+              setIncident(msg.data);
+            } else if (msg.type === "STATE_UPDATED") {
+              setIncident(msg.data);
+            } else if (msg.type === "TIMELINE_EVENT") {
+              setIncident(prev => prev ? {
+                ...prev,
+                timeline: [msg.event, ...prev.timeline]
+              } : prev);
+            } else if (msg.type === "LOG_BATCH") {
+              throughputCounter.current += msg.batch.length;
+              setLogs(prev => [...prev, ...msg.batch].slice(-500));
+            } else if (msg.type === "LOCK_ERROR") {
+              alert(msg.message);
+            }
+          } catch (e) {
+            console.error("Failed to parse WS message:", e);
+          }
+        };
+      } catch (err) {
+        setIsConnected(false);
       }
     };
 
-    // Calculate logs per second every second
-    const interval = setInterval(() => {
+    connectWebSocket();
+
+    // Calculate logs per second throughput
+    const throughputInterval = setInterval(() => {
       setLogThroughput(throughputCounter.current);
       throughputCounter.current = 0;
     }, 1000);
 
     return () => {
-      ws.close();
-      clearInterval(interval);
+      if (ws) ws.close();
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      clearInterval(throughputInterval);
     };
   }, []);
 
-  // 2. Auto-scroll terminal
+  // 2. Client-Side Simulation Fallback when WS is not connected (e.g. Vercel Preview)
+  useEffect(() => {
+    if (isConnected) return;
+
+    // Simulate logs at 10-20/sec so users immediately see the dashboard alive
+    const simInterval = setInterval(() => {
+      const batchSize = Math.floor(Math.random() * 3) + 1;
+      const newLogs = [];
+
+      for (let i = 0; i < batchSize; i++) {
+        simSequenceRef.current += 1;
+        const isError = Math.random() < 0.45;
+        const service = DEMO_SERVICES[Math.floor(Math.random() * DEMO_SERVICES.length)];
+        const level = isError 
+          ? (Math.random() < 0.3 ? "FATAL" : "ERROR") 
+          : (Math.random() < 0.2 ? "WARN" : "INFO");
+        const message = isError 
+          ? DEMO_ERRORS[Math.floor(Math.random() * DEMO_ERRORS.length)]
+          : DEMO_NORMALS[Math.floor(Math.random() * DEMO_NORMALS.length)];
+
+        newLogs.push({
+          seq_id: simSequenceRef.current,
+          timestamp: new Date().toISOString(),
+          service,
+          level,
+          message
+        });
+      }
+
+      throughputCounter.current += newLogs.length;
+      setLogs(prev => [...prev, ...newLogs].slice(-500));
+    }, 120);
+
+    return () => clearInterval(simInterval);
+  }, [isConnected]);
+
+  // 3. Auto-scroll terminal
   useEffect(() => {
     if (logTerminalRef.current) {
       logTerminalRef.current.scrollTop = logTerminalRef.current.scrollHeight;
@@ -67,29 +174,112 @@ export default function App() {
 
   // Actions
   const claimStep = (stepId) => {
-    socketRef.current?.send(JSON.stringify({
-      type: "CLAIM_STEP",
-      stepId,
-      user: currentUser
-    }));
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({
+        type: "CLAIM_STEP",
+        stepId,
+        user: currentUser
+      }));
+    } else {
+      // Local fallback for standalone demo / Vercel preview
+      setIncident(prev => {
+        if (!prev) return prev;
+        const step = prev.runbook.find(s => s.id === stepId);
+        if (!step) return prev;
+        if (step.lockedBy && step.lockedBy !== currentUser) {
+          alert(`Step ${step.id} is currently locked by ${step.lockedBy}`);
+          return prev;
+        }
+        const updatedRunbook = prev.runbook.map(s => s.id === stepId ? {
+          ...s,
+          lockedBy: currentUser,
+          lockedAt: new Date().toISOString(),
+          status: "IN_PROGRESS"
+        } : s);
+        return {
+          ...prev,
+          runbook: updatedRunbook,
+          timeline: [
+            {
+              id: `ev-${Date.now()}`,
+              timestamp: new Date().toISOString(),
+              user: currentUser,
+              message: `Claimed step: "${step.title}"`
+            },
+            ...prev.timeline
+          ]
+        };
+      });
+    }
   };
 
   const completeStep = (stepId) => {
-    socketRef.current?.send(JSON.stringify({
-      type: "COMPLETE_STEP",
-      stepId,
-      user: currentUser
-    }));
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({
+        type: "COMPLETE_STEP",
+        stepId,
+        user: currentUser
+      }));
+    } else {
+      // Local fallback for standalone demo / Vercel preview
+      setIncident(prev => {
+        if (!prev) return prev;
+        const step = prev.runbook.find(s => s.id === stepId);
+        if (!step) return prev;
+        const updatedRunbook = prev.runbook.map(s => s.id === stepId ? {
+          ...s,
+          lockedBy: null,
+          status: "COMPLETED"
+        } : s);
+        const allDone = updatedRunbook.every(s => s.status === "COMPLETED");
+        const timelineEntries = [
+          {
+            id: `ev-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            user: currentUser,
+            message: `Completed step: "${step.title}"`
+          }
+        ];
+        if (allDone) {
+          timelineEntries.unshift({
+            id: `ev-${Date.now()}-res`,
+            timestamp: new Date().toISOString(),
+            user: "System",
+            message: "Incident marked as RESOLVED. Ready for post-mortem export."
+          });
+        }
+        return {
+          ...prev,
+          status: allDone ? "RESOLVED" : prev.status,
+          runbook: updatedRunbook,
+          timeline: [...timelineEntries, ...prev.timeline]
+        };
+      });
+    }
   };
 
   const sendChatMessage = (e) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
-    socketRef.current?.send(JSON.stringify({
-      type: "SEND_CHAT",
-      user: currentUser,
-      text: chatInput
-    }));
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({
+        type: "SEND_CHAT",
+        user: currentUser,
+        text: chatInput
+      }));
+    } else {
+      // Local fallback
+      const event = {
+        id: `ev-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        user: currentUser,
+        message: chatInput
+      };
+      setIncident(prev => prev ? {
+        ...prev,
+        timeline: [event, ...prev.timeline]
+      } : prev);
+    }
     setChatInput("");
   };
 
@@ -135,8 +325,10 @@ ${incident.timeline.map(t => `[${t.timestamp}] **${t.user}**: ${t.message}`).joi
 
         <div className="flex items-center gap-4 text-xs">
           <div className="flex items-center gap-2 bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700">
-            <span className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-emerald-500 animate-ping' : 'bg-rose-500'}`} />
-            <span className="text-slate-300">{isConnected ? 'LIVE FEED ACTIVE' : 'DISCONNECTED'}</span>
+            <span className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-emerald-500 animate-ping' : 'bg-cyan-400'}`} />
+            <span className="text-slate-300">
+              {isConnected ? 'LIVE WS FEED' : 'DEMO MODE (LIVE SIM)'}
+            </span>
           </div>
 
           <div className="flex items-center gap-2 bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700">
@@ -173,7 +365,7 @@ ${incident.timeline.map(t => `[${t.timestamp}] **${t.user}**: ${t.message}`).joi
               <Terminal size={14} className="text-cyan-400" />
               <span>SYNCHRONIZED TELEMETRY STREAM</span>
               <span className="text-slate-600">|</span>
-              <span className="text-slate-500">Buffer: 50ms window</span>
+              <span className="text-slate-500">{isConnected ? 'WS Broadcast (50ms buffer)' : 'Client-Side Simulation Stream'}</span>
             </div>
 
             <div className="flex items-center gap-2">
@@ -200,7 +392,7 @@ ${incident.timeline.map(t => `[${t.timestamp}] **${t.user}**: ${t.message}`).joi
             className="flex-1 p-3 overflow-y-auto font-mono text-[11px] space-y-1 select-text scrollbar-thin scrollbar-thumb-slate-800"
           >
             {filteredLogs.length === 0 ? (
-              <div className="text-slate-600 text-center mt-20">Waiting for simulator logs... Run `npm run simulate` in backend.</div>
+              <div className="text-slate-600 text-center mt-20">Initializing telemetry stream...</div>
             ) : (
               filteredLogs.map(l => (
                 <div key={l.seq_id} className="flex items-start gap-2 hover:bg-slate-900/50 py-0.5 px-1 rounded transition">
@@ -261,7 +453,7 @@ ${incident.timeline.map(t => `[${t.timestamp}] **${t.user}**: ${t.message}`).joi
                     {step.status === 'PENDING' && (
                       <button
                         onClick={() => claimStep(step.id)}
-                        className="bg-blue-600 hover:bg-blue-500 text-white px-2.5 py-1 rounded text-[11px] font-sans font-medium transition"
+                        className="bg-blue-600 hover:bg-blue-500 text-white px-2.5 py-1 rounded text-[11px] font-sans font-medium transition cursor-pointer"
                       >
                         Claim Step
                       </button>
@@ -270,7 +462,7 @@ ${incident.timeline.map(t => `[${t.timestamp}] **${t.user}**: ${t.message}`).joi
                     {step.status === 'IN_PROGRESS' && (
                       <button
                         onClick={() => completeStep(step.id)}
-                        className="bg-emerald-600 hover:bg-emerald-500 text-white px-2.5 py-1 rounded text-[11px] font-sans font-medium transition flex items-center gap-1"
+                        className="bg-emerald-600 hover:bg-emerald-500 text-white px-2.5 py-1 rounded text-[11px] font-sans font-medium transition flex items-center gap-1 cursor-pointer"
                       >
                         <CheckCircle2 size={12} /> Mark Done
                       </button>
@@ -320,7 +512,7 @@ ${incident.timeline.map(t => `[${t.timestamp}] **${t.user}**: ${t.message}`).joi
               />
               <button 
                 type="submit" 
-                className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-xs transition"
+                className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-xs transition cursor-pointer"
               >
                 <Send size={14} />
               </button>
