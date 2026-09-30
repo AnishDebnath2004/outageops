@@ -67,7 +67,8 @@ export default function App() {
     const connectWebSocket = () => {
       try {
         const defaultProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = import.meta.env.VITE_WS_URL || `${defaultProtocol}//localhost:4000`;
+        const defaultHost = window.location.hostname === 'localhost' ? 'localhost:4000' : window.location.host;
+        const wsUrl = import.meta.env.VITE_WS_URL || `${defaultProtocol}//${defaultHost}`;
         
         ws = new WebSocket(wsUrl);
         socketRef.current = ws;
